@@ -1,51 +1,41 @@
 import os
-import time
 import requests
 import pandas as pd
-import threading
 from tvDatafeed import TvDatafeed, Interval
 
 # =====================================================================
 # 🛠️ CONFIGURATION & SECURITY
 # =====================================================================
-# These lines securely fetch the hidden keys you saved in GitHub Secrets!
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")          
 
 AUTO_PAIRS = ["USDINR", "AUDJPY", "NZDJPY", "CADJPY", "CHFJPY", "EURJPY", "GBPJPY", "USDJPY"]
 
-# Thread-safe tracking system
-active_tracks = set()
-lock = threading.Lock()
-
-print("🚀 High-Accuracy 1-Min Multi-Indicator Scanner Online!")
-tv = TvDatafeed() 
+print("🚀 High-Accuracy 1-Min Multi-Indicator Scanner Instance Initialized!")
 
 def send_telegram_signal(message):
     """Sends a formatted notification to your Telegram channel."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        response = requests.post(url, json=payload, timeout=5)
-        if response.status_code != 200:
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code == 200:
+            print("⚡ Telegram notification broadcasted successfully.")
+        else:
             print(f"❌ Telegram API Error: {response.text}")
     except Exception as e:
         print(f"❌ Telegram Connection Error: {e}")
 
 def fetch_data_fast(symbol):
     """Fetches historical bars securely from TradingView."""
-    global tv
     try:
+        tv = TvDatafeed()
         # Request 100 bars to smoothly calculate SMA 50 and dynamic volatility boundaries
         df = tv.get_hist(symbol=symbol, exchange='FX_IDC', interval=Interval.in_1_minute, n_bars=100)
         if df is not None and not df.empty:
             return df
     except Exception as e:
-        print(f"⚠️ TV Fetch Error for {symbol}: {e}. Re-authenticating...")
-        try: 
-            tv = TvDatafeed()
-        except: 
-            pass
+        print(f"⚠️ TV Fetch Error for {symbol}: {e}")
     return None 
 
 def calculate_rsi(series, period=14):
@@ -118,7 +108,7 @@ def evaluate_setup(df, raw_symbol):
     signal_call = (
         trend_bullish and 
         close_p > open_p and 
-        close_p >= env_upper and        # Price breaches/rides the upper structural envelope boundary
+        close_p >= env_upper and        # Price breaches/rides upper structural envelope boundary
         stoch_k > stoch_d and           # Stochastic bullish cross validation
         stoch_k < 80 and                # Filters out exhausted assets that are already overbought
         clean_close_bull and
@@ -129,7 +119,7 @@ def evaluate_setup(df, raw_symbol):
     signal_put = (
         trend_bearish and 
         close_p < open_p and 
-        close_p <= env_lower and        # Price breaches/rides the lower structural envelope boundary
+        close_p <= env_lower and        # Price breaches/rides lower structural envelope boundary
         stoch_k < stoch_d and           # Stochastic bearish cross validation
         stoch_k > 20 and                # Filters out exhausted assets that are already oversold
         clean_close_bear and
@@ -157,63 +147,37 @@ def evaluate_setup(df, raw_symbol):
         "stoch_k": stoch_k
     }
 
-def process_signal(target):
-    """Dispatches background alerts instantly to minimize network lag latency."""
-    pair_name = target['pair_name']
-    raw_symbol = target['raw_symbol']
-    direction = target['direction']
-    
-    print(f"🎯 [MATCH FOUND] {pair_name} | Sending Alerts...")
-    
-    msg = f"🚨 *[HIGH WIN-RATE SIGNAL]* 🚨\n\n"
-    msg += f"🏆 *PAIR:* {pair_name}\n"
-    msg += f"🎯 *ACTION:* {direction}\n"
-    msg += f"📊 *RSI:* {target['rsi']:.1f} | *Stoch %K:* {target['stoch_k']:.1f}\n"
-    msg += f"🔥 *Momentum Force:* {target['score']:.2f}x\n"
-    msg += f"⏱️ *EXPIRY:* 1 MINUTE\n\n"
-    msg += f"⚡ _Execute immediately at the dynamic opening of the new Quotex candlestick!_"
-    
-    send_telegram_signal(msg)
-    
-    # Keep the thread locked for 15 seconds to safely transition past the candle change boundary
-    time.sleep(15)
-    with lock:
-        active_tracks.remove(raw_symbol)
-
 def live_market_runner():
-    """Initializes synchronization loop framework."""
-    print("⏳ Synchronizing to the next clean clock minute-block...")
-    while True:
-        if time.localtime().tm_sec == 0:
-            break
-        time.sleep(0.1)
+    """Executes a clean, singular pass across all target asset classes."""
+    print("🔎 Starting target routine scanning sweep...")
+    
+    for symbol in AUTO_PAIRS:
+        df = fetch_data_fast(symbol)
         
-    print("🟩 Continuous 1-Minute Aggressive Engine Active!")
-
-    while True:
-        current_time = time.localtime()
-        print(f"🔎 [SCANNING] Time: {current_time.tm_hour:02d}:{current_time.tm_min:02d}:00")
-        
-        for symbol in AUTO_PAIRS:
-            with lock:
-                if symbol in active_tracks:
-                    continue
+        if df is None or df.empty:
+            print(f"⚠️ Skipping execution for {symbol}: Historical matrix returned empty.")
+            continue
             
-            df = fetch_data_fast(symbol)
-            metrics = evaluate_setup(df, symbol)
-            
-            if metrics.get('is_valid', False):
-                with lock:
-                    active_tracks.add(symbol)
-                
-                t = threading.Thread(target=process_signal, args=(metrics,))
-                t.daemon = True
-                t.start()
+        metrics = evaluate_setup(df, symbol)
         
-        # Drift-free internal scheduling calculation loop
-        now = time.time()
-        time_to_next_minute = 60 - (now % 60)
-        time.sleep(time_to_next_minute)
+        if metrics.get('is_valid', False):
+            print(f"🎯 [MATCH] {metrics['pair_name']} meets strategy conditions. Dispatching workflow...")
+            
+            msg = f"🚨 *[HIGH WIN-RATE SIGNAL]* 🚨\n\n"
+            msg += f"🏆 *PAIR:* {metrics['pair_name']}\n"
+            msg += f"🎯 *ACTION:* {metrics['direction']}\n"
+            msg += f"📊 *RSI:* {metrics['rsi']:.1f} | *Stoch %K:* {metrics['stoch_k']:.1f}\n"
+            msg += f"🔥 *Momentum Force:* {metrics['score']:.2f}x\n"
+            msg += f"⏱️ *EXPIRY:* 1 MINUTE\n\n"
+            msg += f"⚡ _Execute immediately at the dynamic opening of the new Quotex candlestick!_"
+            
+            send_telegram_signal(msg)
+        else:
+            print(f"⚪ {metrics['pair_name']}: Conditions are neutral.")
 
 if __name__ == "__main__":
-    live_market_runner()
+    try:
+        live_market_runner()
+        print("✅ Scanning loop execution finished perfectly.")
+    except Exception as global_err:
+        print(f"❌ Crucial system breakdown intercepted globally: {global_err}")
