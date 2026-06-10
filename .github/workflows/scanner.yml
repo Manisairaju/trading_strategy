@@ -1,10 +1,10 @@
-name: 1-Min Trading Scanner (6-Hour Window)
+name: 1-Min Trading Scanner (Interval Triggered)
 
 on:
   schedule:
-    # Triggers every day at exactly 09:00 UTC (2:30 PM IST)
-    - cron: '0 9 * * *'
-  workflow_dispatch: # Allows manual trigger
+    # Runs automatically every 5 minutes around the clock (24/7)
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # Keeps your manual "Run workflow" button active
 
 jobs:
   run-scanner:
@@ -25,9 +25,9 @@ jobs:
         pip install pandas requests
         pip install git+https://github.com/rongardF/tvdatafeed.git
 
-    - name: Run Scanner with 6-Hour Timeout
+    - name: Execute Scanner Instance
       env:
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: |
-        timeout 21600 python main.py || echo "Bot session completed successfully after 6 hours."
+        python main.py
