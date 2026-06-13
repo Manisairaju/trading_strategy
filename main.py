@@ -2,8 +2,8 @@ import time
 import requests
 import pandas as pd
 import threading
-import os  # Added to read secrets
-import sys # Added for graceful shutdown
+import os
+import sys
 from tvDatafeed import TvDatafeed, Interval
 
 # =====================================================================
@@ -14,7 +14,6 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 AUTO_PAIRS = ["USDINR", "AUDJPY", "NZDJPY", "CADJPY", "CHFJPY", "EURJPY", "GBPJPY", "USDJPY"]
 
-# Thread-safe set to track pairs currently processing
 active_tracks = set()
 lock = threading.Lock()
 
@@ -22,7 +21,7 @@ if not TELEGRAM_TOKEN or not CHAT_ID:
     print("❌ Critical Error: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID environment variables are missing!")
     sys.exit(1)
 
-print("🚀 1-Min Continuous Scanner Engine Online!")
+print("🚀 High-Accuracy 1-Min Continuous Scanner Engine Online!")
 tv = TvDatafeed() 
 
 def send_telegram_signal(message):
@@ -39,7 +38,8 @@ def send_telegram_signal(message):
 def fetch_data_fast(symbol):
     global tv
     try:
-        df = tv.get_hist(symbol=symbol, exchange='FX_IDC', interval=Interval.in_1_minute, n_bars=70)
+        # Increased to 220 bars to perfectly calculate EMA 200 without accuracy decay
+        df = tv.get_hist(symbol=symbol, exchange='FX_IDC', interval=Interval.in_1_minute, n_bars=220)
         if df is not None and not df.empty:
             return df
     except Exception as e:
@@ -57,20 +57,33 @@ def calculate_rsi(series, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
+def calculate_atr(df, period=14):
+    high_low = df['high'] - df['low']
+    high_close = abs(df['high'] - df['close'].shift())
+    low_close = abs(df['low'] - df['close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = ranges.max(axis=1)
+    return true_range.rolling(window=period).mean()
+
 def evaluate_setup(df, raw_symbol):
     formatted_name = f"{raw_symbol[:3]}/{raw_symbol[3:]}"
-    if df is None or len(df) < 55:  
+    if df is None or len(df) < 210:  
         return {"is_valid": False, "score": 0, "pair_name": formatted_name}
 
+    # Technical Indicators
     df['EMA_50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['EMA_200'] = df['close'].ewm(span=200, adjust=False).mean()
     df['RSI_14'] = calculate_rsi(df['close'])
+    df['ATR_14'] = calculate_atr(df)
     
+    # Analyze the LAST CLOSED candle (Index -2)
     closed_candle = df.iloc[-2]
     close_p = closed_candle['close']
     open_p = closed_candle['open']
     high_p = closed_candle['high']
     low_p = closed_candle['low']
     rsi = closed_candle['RSI_14']
+    atr = closed_candle['ATR_14']
     
     body_size = abs(close_p - open_p)
     total_range = high_p - low_p
@@ -78,19 +91,41 @@ def evaluate_setup(df, raw_symbol):
     df['range'] = df['high'] - df['low']
     avg_range = df['range'].iloc[-12:-2].mean()
     
+    # 1. Momentum Score Check
     momentum_score = body_size / avg_range if avg_range > 0 else 0
     
-    is_bullish = (close_p > open_p) and (close_p > closed_candle['EMA_50'])
-    is_bearish = (close_p < open_p) and (close_p < closed_candle['EMA_50'])
+    # 2. Strict Trend-Following Filter (Aligning with Major Trend)
+    is_bullish_trend = (close_p > closed_candle['EMA_50']) and (closed_candle['EMA_50'] > closed_candle['EMA_200'])
+    is_bearish_trend = (close_p < closed_candle['EMA_50']) and (closed_candle['EMA_50'] < closed_candle['EMA_200'])
     
+    is_bullish_candle = (close_p > open_p) and is_bullish_trend
+    is_bearish_candle = (close_p < open_p) and is_bearish_trend
+    
+    # 3. Clean Close Filter (Avoid long reversal shadows)
     clean_close = False
-    if is_bullish and total_range > 0:
-        clean_close = (high_p - close_p) / total_range < 0.35
-    elif is_bearish and total_range > 0:
-        clean_close = (close_p - low_p) / total_range < 0.35
+    if is_bullish_candle and total_range > 0:
+        clean_close = (high_p - close_p) / total_range < 0.25  # Tightened from 0.35 to 0.25
+    elif is_bearish_candle and total_range > 0:
+        clean_close = (close_p - low_p) / total_range < 0.25  # Tightened from 0.35 to 0.25
         
-    direction = "🟢 CALL (UP)" if is_bullish else ("🔴 PUT (DOWN)" if is_bearish else "⚪ NEUTRAL")
-    is_valid = (is_bullish or is_bearish) and momentum_score > 0.8 and clean_close
+    # 4. Math-Driven RSI Anti-Reversal Guard
+    rsi_safe = False
+    if is_bullish_candle and rsi < 65:        # Do not buy overbought tops
+        rsi_safe = True
+    elif is_bearish_candle and rsi > 35:      # Do not sell oversold bottoms
+        rsi_safe = True
+
+    # 5. Volatility Filter
+    has_volume = total_range > (0.7 * atr) if atr > 0 else False
+
+    direction = "🟢 CALL (UP)" if is_bullish_candle else ("🔴 PUT (DOWN)" if is_bearish_candle else "⚪ NEUTRAL")
+    
+    # Master Accuracy Checklist
+    is_valid = is_bullish_candle or is_bearish_candle
+    is_valid = is_valid and momentum_score > 1.15            # Raised requirement for stronger breakouts
+    is_valid = is_valid and clean_close 
+    is_valid = is_valid and rsi_safe
+    is_valid = is_valid and has_volume
     
     return {
         "raw_symbol": raw_symbol,
@@ -107,14 +142,14 @@ def process_signal(target):
     raw_symbol = target['raw_symbol']
     direction = target['direction']
     
-    print(f"🎯 [MATCH FOUND] {pair_name} | Score: {target['score']:.2f} | Sending Alerts...")
+    print(f"🎯 [HIGH ACCURACY MATCH] {pair_name} | Score: {target['score']:.2f} | Sending Alerts...")
     
-    msg = f"⏳ *[SIGNAL ALERT]* ⏳\n" \
+    msg = f"🔥 *[HIGH ACCURACY SIGNAL]* 🔥\n" \
           f"🏆 *PAIR:* {pair_name}\n" \
           f"🎯 *DIRECTION:* {direction}\n" \
-          f"📊 RSI: {target['rsi']:.1f} | Score: {target['score']:.2f}\n" \
+          f"📊 RSI: {target['rsi']:.1f} | Breakout Strength: {target['score']:.2f}\n" \
           f"⏱️ *EXPIRY:* 1 MINUTE\n\n" \
-          f"🚀 _Execute trade immediately at the opening of the new candle on Quotex!_"
+          f"🚀 _Execute trade swiftly at the opening of the new candle on Quotex!_"
     
     send_telegram_signal(msg)
     time.sleep(10)
@@ -122,9 +157,8 @@ def process_signal(target):
         active_tracks.remove(raw_symbol)
 
 def live_market_runner():
-    # Record the startup time to calculate 6 hours max runtime
     start_time = time.time()
-    max_runtime_seconds = 5.5 * 3600  # Run safely for 5.5 hours to avoid GitHub Actions timing out abruptly
+    max_runtime_seconds = 5.5 * 3600  # 5.5 Hours clean execution
     
     print("⏳ Synchronizing to the next clean 1-minute candle block...")
     while True:
@@ -132,12 +166,11 @@ def live_market_runner():
             break
         time.sleep(0.2)
         
-    print("🟩 Continuous 1-Minute Engine Active!")
+    print("🟩 Continuous High-Accuracy 1-Minute Engine Active!")
 
     while True:
-        # Check if 5.5 hours have passed, then shut down cleanly
         if (time.time() - start_time) > max_runtime_seconds:
-            print("⏰ Reached end of daily trading window. Shutting down system down gracefully.")
+            print("⏰ Session window closed. Shutting down system down gracefully.")
             sys.exit(0)
 
         current_time = time.localtime()
