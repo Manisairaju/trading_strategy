@@ -5,12 +5,11 @@ import time
 import os
 import sys
 import requests
-import pandas as pd
 import numpy as np
 from websocket import create_connection
 
 # =====================================================================
-# 🛠️ SYSTEM CONFIGURATION (GitHub Secrets Enabled)
+# 🛠️ SYSTEM CONFIGURATION
 # =====================================================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -19,7 +18,6 @@ if not TELEGRAM_TOKEN or not CHAT_ID:
     print("❌ Critical Error: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID Secrets are missing!")
     sys.exit(1)
 
-# We use FX_IDC feeds via TradingView's public websocket (No login required)
 PAIRS = {
     "USDJPY": "FX_IDC:USDJPY",
     "AUDJPY": "FX_IDC:AUDJPY",
@@ -29,25 +27,37 @@ PAIRS = {
     "GBPJPY": "FX_IDC:GBPJPY"
 }
 
-# In-memory database to store real-time tick ticks
-market_data = {pair: [] for pair in PAIRS.keys()}
+raw_tick_storage = {pair: {} for pair in PAIRS.keys()}
+historical_candles = {pair: [] for pair in PAIRS.keys()}
 active_tracks = set()
 lock = threading.Lock()
 
 def send_telegram_signal(message):
-    """Sends immediate alert to your Telegram Channel via GitHub Secrets."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
         response = requests.post(url, json=payload, timeout=4)
-        if response.status_code != 200:
-            print(f"❌ Telegram API Error: {response.text}")
+        return response.json().get("result", {}).get("message_id")
     except Exception as e:
-        print(f"❌ Telegram Connection Error: {e}")
+        print(f"❌ Telegram Error: {e}")
+        return None
+
+def edit_telegram_message(message_id, updated_text):
+    """Updates the original pre-signal message in real-time to avoid chat clutter."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
+    payload = {
+        "chat_id": CHAT_ID,
+        "message_id": message_id,
+        "text": updated_text,
+        "parse_mode": "Markdown"
+    }
+    try:
+        requests.post(url, json=payload, timeout=4)
+    except Exception as e:
+        print(f"❌ Telegram Edit Error: {e}")
 
 def generate_session_id():
-    string_set = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    return "".join(random.choice(string_set) for _ in range(12))
+    return "".join(random.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") for _ in range(12))
 
 def prepend_header(st):
     return f"~m~{len(st)}~m~{st}"
@@ -56,7 +66,6 @@ def create_message(func, param_list):
     return json.dumps({"m": func, "p": param_list}, separators=(",", ":"))
 
 def live_websocket_worker():
-    """Connects to public TradingView servers and streams ticks instantly."""
     while True:
         try:
             ws = create_connection(
@@ -70,7 +79,7 @@ def live_websocket_worker():
             for internal_name, tv_symbol in PAIRS.items():
                 ws.send(prepend_header(create_message("quote_add_symbols", [session, tv_symbol, {"qty": 1}])))
             
-            print("🟩 Live Stream WebSocket Established (No-Login Engine Connected)")
+            print("🟩 Dual-Stage Confirmation Engine Live.")
             
             while True:
                 result = ws.recv()
@@ -93,110 +102,150 @@ def live_websocket_worker():
                                         if price:
                                             for name, tv_name in PAIRS.items():
                                                 if tv_name == symbol_raw:
-                                                    market_data[name].append({
-                                                        "timestamp": time.time(),
-                                                        "price": float(price)
-                                                    })
+                                                    now_sec = time.time()
+                                                    minute_floor = int(now_sec // 60) * 60
+                                                    
+                                                    with lock:
+                                                        if minute_floor not in raw_tick_storage[name]:
+                                                            raw_tick_storage[name][minute_floor] = []
+                                                        raw_tick_storage[name][minute_floor].append(float(price))
                             except:
                                 pass
         except Exception as e:
-            print(f"⚠️ Connection dropped: {e}. Reconnecting in 3 seconds...")
             time.sleep(3)
 
-# =====================================================================
-# 📊 MATHEMATICAL ANALYSIS WORKER
-# =====================================================================
-def calculate_rsi_live(prices, period=14):
-    if len(prices) < period + 1:
-        return 50
-    deltas = np.diff(prices)
+def calculate_true_rsi(candle_closes, period=14):
+    if len(candle_closes) < period + 1:
+        return 50.0
+    deltas = np.diff(candle_closes)
     seed = deltas[:period]
     up = seed[seed >= 0].sum() / period
     down = -seed[seed < 0].sum() / period
-    rs = up / down if down != 0 else 0
-    rsi = np.zeros_like(prices)
-    rsi[:period+1] = 100. - 100. / (1. + rs)
+    if down == 0: return 100.0
+    return 100. - (100. / (1. + (up / down)))
 
-    for i in range(period + 1, len(prices)):
-        delta = deltas[i - 1]
-        upval = delta if delta > 0 else 0.
-        downval = -delta if delta < 0 else 0.
-        up = (up * (period - 1) + upval) / period
-        down = (down * (period - 1) + downval) / period
-        rs = up / down if down != 0 else 0
-        rsi[i] = 100. - 100. / (1. + rs)
-    return rsi[-1]
-
-def process_signal(pair, direction, rsi_val):
-    print(f"🎯 [SIGNAL MATCHED] sending alert for {pair}...")
+# =====================================================================
+# 🔍 DUAL-STAGE VERIFICATION LOOP
+# =====================================================================
+def verify_at_second_55(pair, direction, rsi_val, msg_id, minute_floor):
+    """Runs a hard checkpoint 5 seconds before candle close to confirm or abort."""
+    time.sleep(10) # Wait from second 45 to second 55
     
-    msg = f"⏳ *[20-SECOND PRE-SIGNAL]* ⏳\n" \
-          f"🏆 *PAIR:* {pair[:3]}/{pair[3:]}\n" \
-          f"🎯 *DIRECTION:* {direction}\n" \
-          f"📊 Live RSI: {rsi_val:.1f}\n" \
-          f"⏱️ *EXPIRY:* 1 MINUTE\n\n" \
-          f"🚀 _Open asset on Quotex now! Place trade exactly at the start of the next minute candle!_"
-          
-    send_telegram_signal(msg)
-    time.sleep(25)  # Lock execution for safety
+    with lock:
+        live_ticks = list(raw_tick_storage[pair].get(minute_floor, []))
+        
+    if len(live_ticks) < 5:
+        # Data stream dropped, abort for safety
+        abort_text = f"❌ *[SIGNAL CANCELLED]* ❌\n\n🏆 *PAIR:* {pair[:3]}/{pair[3:]}\n⚠️ *REASON:* Feed lag detected at second 55. *DO NOT TAKE THIS TRADE!*"
+        edit_telegram_message(msg_id, abort_text)
+        with lock: active_tracks.remove(pair)
+        return
+
+    c_open = live_ticks[0]
+    c_close = live_ticks[-1]
+    c_high = max(live_ticks)
+    c_low = min(live_ticks)
+    c_range = c_high - c_low
+
+    is_valid = False
+    
+    # Check if the rejection wick structural ratio is still intact at second 55
+    if c_range > 0:
+        if direction == "🟢 CALL (UP)":
+            lower_wick = c_open - c_low
+            # Reversal criteria check: Wick must maintain structural dominance
+            if (lower_wick / c_range) >= 0.45 and c_close >= c_open:
+                is_valid = True
+        elif direction == "🔴 PUT (DOWN)":
+            upper_wick = c_high - c_open
+            if (upper_wick / c_range) >= 0.45 and c_close <= c_open:
+                is_valid = True
+
+    if is_valid:
+        confirm_text = f"✅ *[TAKE TRADE NOW!]* ✅\n\n" \
+                       f"🏆 *PAIR:* {pair[:3]}/{pair[3:]}\n" \
+                       f"🎯 *ACTION:* {direction}\n" \
+                       f"📊 True RSI: {rsi_val:.1f}\n" \
+                       f"⏱️ *EXPIRY:* 1 MINUTE\n\n" \
+                       f"🚀 _The rejection shape held at second 55. Execute your entry on Quotex exactly at the 00:00 countdown transition!_"
+        edit_telegram_message(msg_id, confirm_text)
+    else:
+        reject_text = f"❌ *[DO NOT TAKE - CANCELLED]* ❌\n\n" \
+                      f"🏆 *PAIR:* {pair[:3]}/{pair[3:]}\n" \
+                      f"⚠️ *REASON:* Candle reversal occurred between seconds 45 and 55. The rejection pattern collapsed. *SKIP THIS TRADE!*"
+                      
+        edit_telegram_message(msg_id, reject_text)
+
+    time.sleep(15)
     with lock:
         active_tracks.remove(pair)
 
 def execute_analysis_cycle():
-    print("🔎 Scanning live feeds for setups...")
+    print("🔎 Scanning order flow matrix for high-probability setups...")
     last_processed_minute = -1
     
     while True:
         now = time.localtime()
-        # Triggers exactly at the 40th second mark (20 seconds before new candle)
-        if now.tm_sec == 40 and now.tm_min != last_processed_minute:
+        if now.tm_sec == 45 and now.tm_min != last_processed_minute:
             last_processed_minute = now.tm_min
+            current_time_sec = time.time()
+            minute_floor = int(current_time_sec // 60) * 60
             
-            for pair, ticks in market_data.items():
+            for pair in PAIRS.keys():
                 with lock:
-                    if pair in active_tracks or len(ticks) < 15:
-                        continue
+                    if pair in active_tracks: continue
+                        
+                    for past_min in list(raw_tick_storage[pair].keys()):
+                        if past_min < minute_floor:
+                            ticks = raw_tick_storage[pair].pop(past_min)
+                            if len(ticks) >= 5:
+                                historical_candles[pair].append([ticks[0], max(ticks), min(ticks), ticks[-1]])
+                                if len(historical_candles[pair]) > 30: historical_candles[pair].pop(0)
                 
-                df_ticks = pd.DataFrame(ticks)
-                current_cutoff = time.time()
-                one_minute_ago = current_cutoff - 40
+                with lock:
+                    live_ticks = list(raw_tick_storage[pair].get(minute_floor, []))
+                    history = list(historical_candles[pair])
                 
-                live_ticks = df_ticks[df_ticks['timestamp'] >= one_minute_ago]['price'].tolist()
-                historical_ticks = df_ticks[df_ticks['timestamp'] < one_minute_ago]['price'].tolist()
+                if len(live_ticks) < 10 or len(history) < 15: continue
                 
-                if not live_ticks or len(historical_ticks) < 20:
-                    continue
+                c_open, c_close = live_ticks[0], live_ticks[-1]
+                c_high, c_low = max(live_ticks), min(live_ticks)
+                c_range = c_high - c_low
+                if c_range == 0: continue
                 
-                open_p = live_ticks[0]
-                close_p = live_ticks[-1]
-                high_p = max(live_ticks)
-                low_p = min(live_ticks)
-                
-                total_range = high_p - low_p
-                all_prices_sampled = historical_ticks[-50:] + [close_p]
-                rsi_value = calculate_rsi_live(all_prices_sampled)
+                rsi_value = calculate_true_rsi([candle[3] for candle in history] + [c_close])
+                liquidity_pool_high = max([candle[1] for candle in history[-5:]])
+                liquidity_pool_low = min([candle[2] for candle in history[-5:]])
                 
                 direction = None
-                if total_range > 0:
-                    lower_wick = min(open_p, close_p) - low_p
-                    upper_wick = high_p - max(open_p, close_p)
-                    
-                    if lower_wick / total_range > 0.45 and close_p > open_p and 45 < rsi_value < 58:
-                        direction = "🟢 CALL (UP)"
-                    elif upper_wick / total_range > 0.45 and close_p < open_p and 42 < rsi_value < 55:
+                if c_high >= liquidity_pool_high and c_close < c_open:
+                    if ((c_high - c_open) / c_range) > 0.50 and rsi_value > 68:
                         direction = "🔴 PUT (DOWN)"
+                elif c_low <= liquidity_pool_low and c_close > c_open:
+                    if ((c_open - c_low) / c_range) > 0.50 and rsi_value < 32:
+                        direction = "🟢 CALL (UP)"
                 
                 if direction:
-                    with lock:
-                        active_tracks.add(pair)
-                    t = threading.Thread(target=process_signal, args=(pair, direction, rsi_value))
-                    t.daemon = True
-                    t.start()
-                
-                # Housekeeping memory array size optimization
-                market_data[pair] = ticks[-500:]
-                
-        time.sleep(0.2)
+                    with lock: active_tracks.add(pair)
+                    
+                    # Stage 1 Message: Pre-Signal Sent at Second 45
+                    pre_msg = f"⏳ *[15-SECOND PRE-SIGNAL]* ⏳\n\n" \
+                              f"🏆 *PAIR:* {pair[:3]}/{pair[3:]}\n" \
+                              f"🎯 *POTENTIAL DIRECTION:* {direction}\n" \
+                              f"⏱️ *EXPIRY:* 1 MINUTE\n\n" \
+                              f"⚠️ *ACTION:* Prepare your pair and trade amount on Quotex now. *DO NOT entry yet.* Wait for second 55 automated check updates below..."
+                    
+                    msg_id = send_telegram_signal(pre_msg)
+                    
+                    if msg_id:
+                        # Spin up tracking thread to evaluate live candle changes at second 55
+                        t = threading.Thread(target=verify_at_second_55, args=(pair, direction, rsi_value, msg_id, minute_floor))
+                        t.daemon = True
+                        t.start()
+                    else:
+                        with lock: active_tracks.remove(pair)
+                        
+        time.sleep(0.1)
 
 if __name__ == "__main__":
     ws_thread = threading.Thread(target=live_websocket_worker, daemon=True)
