@@ -4,7 +4,7 @@ on:
   schedule:
     # 09:00 UTC corresponds exactly to 2:30 PM IST (Indian Standard Time)
     - cron: '0 9 * * *'
-  workflow_dispatch: # Allows you to also trigger it manually whenever you want
+  workflow_dispatch: # Allows manual trigger execution
 
 jobs:
   run-scanner:
@@ -17,7 +17,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-node-version: '3.10'
+        python-version: '3.10' # 🟢 Fixed: Changed to the correct parameter name
 
     - name: Install Dependencies
       run: |
