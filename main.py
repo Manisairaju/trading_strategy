@@ -247,7 +247,32 @@ def execute_analysis_cycle():
                         
         time.sleep(0.1)
 
+# =====================================================================
+# 🌐 RENDER HEALTH CHECK SERVER
+# =====================================================================
+def run_health_check_server():
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    class HealthCheckHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Scanner Engine Live")
+        def log_message(self, format, *args):
+            return  # Suppress internal server logging to keep terminal clean
+
+    # Render web services assign and listen on port 10000 by default
+    server = HTTPServer(('0.0.0.0', 10000), HealthCheckHandler)
+    server.serve_forever()
+
 if __name__ == "__main__":
+    # Start the web server framework in a background thread
+    health_thread = threading.Thread(target=run_health_check_server, daemon=True)
+    health_thread.start()
+
+    # Start the Web Socket connection engine
     ws_thread = threading.Thread(target=live_websocket_worker, daemon=True)
     ws_thread.start()
+
+    # Initiate scanning pipeline
     execute_analysis_cycle()
