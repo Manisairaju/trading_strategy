@@ -2392,7 +2392,17 @@ def main():
     print("=" * 60)
 
     # Create result CSV if it does not already exist.
+        # Create result CSV if it does not already exist.
     initialize_result_file()
+
+    send_telegram(
+        "✅ *Telegram connection test successful!*\n\n"
+        "Your trading signal bot is connected and ready."
+    )
+
+    # ------------------------------------------------------------
+    # LOAD HISTORICAL M1 DATA
+    # ------------------------------------------------------------
 
     # ------------------------------------------------------------
     # LOAD HISTORICAL M1 DATA
